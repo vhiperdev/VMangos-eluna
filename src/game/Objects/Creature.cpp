@@ -2856,7 +2856,7 @@ time_t Creature::GetRespawnTimeEx() const
 void Creature::GetRespawnCoord(float &x, float &y, float &z, float* ori, float* dist) const
 {
     // Nostalrius : pouvoir changer point de spawn d'un mob -> Creature::SetHomePosition
-    if (m_homePosition.x > 0.1f || m_homePosition.y < -0.1f)
+    if (m_homePosition.x > 0.1f || m_homePosition.x < -0.1f)
     {
         x = m_homePosition.x;
         y = m_homePosition.y;
@@ -3556,17 +3556,6 @@ SpellCastResult Creature::TryToCast(Unit* pTarget, SpellEntry const* pSpellInfo,
 
     spell->SetCastItem(nullptr);
     return spell->prepare(std::move(targets), nullptr, uiChance);
-}
-
-bool Creature::CantPathToVictim() const
-{
-    if (!GetVictim())
-        return false;
-
-    if (GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
-        return false;
-
-    return !GetMotionMaster()->GetCurrent()->IsReachable();
 }
 
 // use this function to avoid having hostile creatures attack

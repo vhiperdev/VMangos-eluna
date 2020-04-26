@@ -6260,7 +6260,8 @@ void ObjectMgr::LoadBattlegroundEntranceTriggers()
         AreaTriggerEntry const* bgetEntry = GetAreaTrigger(triggerId);
         if (!bgetEntry)
         {
-            sLog.outErrorDb("Table `areatrigger_bg_entrance` has area trigger (ID:%u) not listed in `AreaTrigger.dbc`.", triggerId);
+            if (!IsExistingAreaTriggerId(triggerId))
+                sLog.outErrorDb("Table `areatrigger_bg_entrance` has area trigger (ID:%u) not listed in `AreaTrigger.dbc`.", triggerId);
             continue;
         }
 
@@ -8992,7 +8993,7 @@ bool ObjectMgr::LoadQuestGreetings()
     for (auto& i : m_QuestGreetingLocaleMap)
         i.clear(); // need for reload case
 
-    std::unique_ptr<QueryResult> result(WorldDatabase.Query("SELECT `entry`, `type`, `content_default`, `content_loc1`, `content_loc2`, `content_loc3`, `content_loc4`, `content_loc5`, `content_loc6`, `content_loc7`, `content_loc8`, `Emote`, `EmoteDelay` FROM `quest_greeting`"));
+    std::unique_ptr<QueryResult> result(WorldDatabase.Query("SELECT `entry`, `type`, `content_default`, `content_loc1`, `content_loc2`, `content_loc3`, `content_loc4`, `content_loc5`, `content_loc6`, `content_loc7`, `content_loc8`, `emote_id`, `emote_delay` FROM `quest_greeting`"));
 
     if (!result)
     {
@@ -9529,7 +9530,7 @@ void ObjectMgr::LoadVendors(char const* tableName, bool isTemplates)
 
     std::set<uint32> skip_vendors;
 
-    std::unique_ptr<QueryResult> result(WorldDatabase.PQuery("SELECT `entry`, `item`, `maxcount`, `incrtime`, `itemflags` FROM %s WHERE (`item` NOT IN (SELECT `entry` FROM `forbidden_items` WHERE (`after_or_before` = 0 && `patch` <= %u) || (`after_or_before` = 1 && `patch` >= %u)))", tableName, sWorld.GetWowPatch(), sWorld.GetWowPatch()));
+    std::unique_ptr<QueryResult> result(WorldDatabase.PQuery("SELECT `entry`, `item`, `maxcount`, `incrtime`, `itemflags`, `condition_id` FROM %s WHERE (`item` NOT IN (SELECT `entry` FROM `forbidden_items` WHERE (`after_or_before` = 0 && `patch` <= %u) || (`after_or_before` = 1 && `patch` >= %u)))", tableName, sWorld.GetWowPatch(), sWorld.GetWowPatch()));
     if (!result)
     {
         BarGoLink bar(1);
@@ -9553,13 +9554,14 @@ void ObjectMgr::LoadVendors(char const* tableName, bool isTemplates)
         uint32 maxcount     = fields[2].GetUInt32();
         uint32 incrtime     = fields[3].GetUInt32();
         uint32 itemflags    = fields[4].GetUInt32();
+        uint32 conditionId  = fields[5].GetUInt32();
 
-        if (!IsVendorItemValid(isTemplates, tableName, entry, item_id, maxcount, incrtime, nullptr, &skip_vendors))
+        if (!IsVendorItemValid(isTemplates, tableName, entry, item_id, maxcount, incrtime, conditionId, nullptr, &skip_vendors))
             continue;
 
         VendorItemData& vList = vendorList[entry];
 
-        vList.AddItem(item_id, maxcount, incrtime, itemflags);
+        vList.AddItem(item_id, maxcount, incrtime, itemflags, conditionId);
         ++count;
 
     }
@@ -9807,6 +9809,14 @@ void ObjectMgr::LoadGossipMenuItems()
             }
         }
 
+        // World of Warcraft Client Patch 1.7.0 (2005-09-13)
+        // - Hunter pets can now be untrained of all their skills from
+        //   any beast trainer in the major cities.
+#if SUPPORTED_CLIENT_BUILD <= CLIENT_BUILD_1_6_1
+        if (gMenuItem.option_id == GOSSIP_OPTION_UNLEARNPETSKILLS)
+            continue;
+#endif
+
         if ((gMenuItem.option_id == GOSSIP_OPTION_GOSSIP) && (gMenuItem.action_menu_id > 0))
         {
             if (m_GossipMenusMap.find(gMenuItem.action_menu_id) == m_GossipMenusMap.end())
@@ -9820,6 +9830,9 @@ void ObjectMgr::LoadGossipMenuItems()
             sLog.outErrorDb("Table gossip_menu_option for menu %u, id %u has unknown icon id %u. Replacing with GOSSIP_ICON_CHAT", gMenuItem.menu_id, gMenuItem.id, gMenuItem.option_icon);
             gMenuItem.option_icon = GOSSIP_ICON_CHAT;
         }
+
+        if (!IsValidGossipOptionIconForBuild(gMenuItem.option_icon))
+            gMenuItem.option_icon = GOSSIP_ICON_CHAT;
 
         if (gMenuItem.OptionBroadcastTextID)
         {
@@ -9920,7 +9933,7 @@ void ObjectMgr::LoadGossipMenuItems()
 void ObjectMgr::AddVendorItem(uint32 entry, uint32 item, uint32 maxcount, uint32 incrtime, uint32 itemflags)
 {
     VendorItemData& vList = m_CacheVendorItemMap[entry];
-    vList.AddItem(item, maxcount, incrtime, itemflags);
+    vList.AddItem(item, maxcount, incrtime, itemflags, 0);
 
     WorldDatabase.PExecuteLog("INSERT INTO `npc_vendor` (`entry`, `item`, `maxcount`, `incrtime`, `itemflags`) VALUES('%u','%u','%u','%u','%u')", entry, item, maxcount, incrtime, itemflags);
 }
@@ -9939,7 +9952,7 @@ bool ObjectMgr::RemoveVendorItem(uint32 entry, uint32 item)
     return true;
 }
 
-bool ObjectMgr::IsVendorItemValid(bool isTemplate, char const* tableName, uint32 vendor_entry, uint32 item_id, uint32 maxcount, uint32 incrtime, Player* pl, std::set<uint32>* skip_vendors) const
+bool ObjectMgr::IsVendorItemValid(bool isTemplate, char const* tableName, uint32 vendor_entry, uint32 item_id, uint32 maxcount, uint32 incrtime, uint32 conditionId, Player* pl, std::set<uint32>* skip_vendors) const
 {
     char const* idStr = isTemplate ? "vendor template" : "vendor";
     CreatureInfo const* cInfo = nullptr;
@@ -10000,6 +10013,12 @@ bool ObjectMgr::IsVendorItemValid(bool isTemplate, char const* tableName, uint32
         else
             sLog.outErrorDb("Table `%s` has `maxcount`=0 for item %u of %s %u but `incrtime`<>0, ignoring",
                             tableName, item_id, idStr, vendor_entry);
+        return false;
+    }
+
+    if (conditionId && !sConditionStorage.LookupEntry<ConditionEntry>(conditionId))
+    {
+        sLog.outErrorDb("Table `%s` has `condition_id`=%u for item %u of %s %u but this condition is not valid, ignoring", tableName, conditionId, item_id, idStr, vendor_entry);
         return false;
     }
 
@@ -10871,8 +10890,8 @@ void ObjectMgr::LoadPlayerPremadeTemplates()
         sLog.outString("Loading player premade gear templates ...");
         m_playerPremadeGearMap.clear();
 
-        //                                                               0        1        2        3
-        std::unique_ptr<QueryResult> result(WorldDatabase.Query("SELECT `entry`, `class`, `level`, `name` FROM `player_premade_item_template`"));
+        //                                                               0        1        2        3       4
+        std::unique_ptr<QueryResult> result(WorldDatabase.Query("SELECT `entry`, `class`, `level`, `role`, `name` FROM `player_premade_item_template`"));
 
         if (!result)
         {
@@ -10893,7 +10912,8 @@ void ObjectMgr::LoadPlayerPremadeTemplates()
             uint32 entry = fields[0].GetUInt32();
             uint8 requiredClass = fields[1].GetUInt8();
             uint8 level = fields[2].GetUInt8();
-            std::string name = fields[3].GetCppString();
+            uint8 role = fields[3].GetUInt8();
+            std::string name = fields[4].GetCppString();
 
             switch (requiredClass)
             {
@@ -10922,6 +10942,7 @@ void ObjectMgr::LoadPlayerPremadeTemplates()
             data.entry = entry;
             data.requiredClass = requiredClass;
             data.level = level;
+            data.role = CombatBotRoles(role);
             data.name = name;
 
         } while (result->NextRow());
@@ -10992,8 +11013,8 @@ void ObjectMgr::LoadPlayerPremadeTemplates()
         sLog.outString("Loading player premade spec templates ...");
         m_playerPremadeSpecMap.clear();
 
-        //                                                               0        1        2        3
-        std::unique_ptr<QueryResult> result(WorldDatabase.Query("SELECT `entry`, `class`, `level`, `name` FROM `player_premade_spell_template`"));
+        //                                                               0        1        2        3       4
+        std::unique_ptr<QueryResult> result(WorldDatabase.Query("SELECT `entry`, `class`, `level`, `role`, `name` FROM `player_premade_spell_template`"));
 
         if (!result)
         {
@@ -11014,7 +11035,8 @@ void ObjectMgr::LoadPlayerPremadeTemplates()
             uint32 entry = fields[0].GetUInt32();
             uint8 requiredClass = fields[1].GetUInt8();
             uint8 level = fields[2].GetUInt8();
-            std::string name = fields[3].GetCppString();
+            uint8 role = fields[3].GetUInt8();
+            std::string name = fields[4].GetCppString();
 
             switch (requiredClass)
             {
@@ -11043,6 +11065,7 @@ void ObjectMgr::LoadPlayerPremadeTemplates()
             data.entry = entry;
             data.requiredClass = requiredClass;
             data.level = level;
+            data.role = CombatBotRoles(role);
             data.name = name;
 
         } while (result->NextRow());
@@ -11122,7 +11145,7 @@ void ObjectMgr::ApplyPremadeGearTemplateToPlayer(uint32 entry, Player* pPlayer) 
         pPlayer->AutoUnequipItemFromSlot(i);
 
     // Learn Dual Wield Specialization
-    if (pPlayer->GetClass() == CLASS_WARRIOR || pPlayer->GetClass() == CLASS_ROGUE)
+    if (pPlayer->GetClass() == CLASS_WARRIOR || pPlayer->GetClass() == CLASS_ROGUE || pPlayer->GetClass() == CLASS_HUNTER)
         if (!pPlayer->HasSpell(674))
             pPlayer->LearnSpell(674, false, false);
 
@@ -11131,6 +11154,12 @@ void ObjectMgr::ApplyPremadeGearTemplateToPlayer(uint32 entry, Player* pPlayer) 
         if (!item.requiredTeam || (pPlayer->GetTeam() == item.requiredTeam))
         {
             ItemPrototype const* pItem = GetItemPrototype(item.itemId);
+
+            // Set required reputation
+            if (pItem->RequiredReputationFaction && pItem->RequiredReputationRank)
+                if (FactionEntry const* pFaction = GetFactionEntry(pItem->RequiredReputationFaction))
+                    if (pPlayer->GetReputationMgr().GetRank(pFaction) < pItem->RequiredReputationRank)
+                        pPlayer->GetReputationMgr().SetReputation(pFaction, pPlayer->GetReputationMgr().GetRepPointsToRank(ReputationRank(pItem->RequiredReputationRank)));
 
             // Learn required profession
             if (pItem->RequiredSkill && !pPlayer->HasSkill(pItem->RequiredSkill))
@@ -11169,7 +11198,7 @@ void ObjectMgr::ApplyPremadeSpecTemplateToPlayer(uint32 entry, Player* pPlayer) 
     }
 
     // Learn Dual Wield Specialization
-    if (pPlayer->GetClass() == CLASS_WARRIOR || pPlayer->GetClass() == CLASS_ROGUE)
+    if (pPlayer->GetClass() == CLASS_WARRIOR || pPlayer->GetClass() == CLASS_ROGUE || pPlayer->GetClass() == CLASS_HUNTER)
         if (!pPlayer->HasSpell(674))
             pPlayer->LearnSpell(674, false, false);
 
