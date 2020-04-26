@@ -111,8 +111,9 @@ Unit::Unit()
 {
     m_objectType |= TYPEMASK_UNIT;
     m_objectTypeId = TYPEID_UNIT;
+#if SUPPORTED_CLIENT_BUILD > CLIENT_BUILD_1_8_4
     m_updateFlag = (UPDATEFLAG_ALL | UPDATEFLAG_LIVING | UPDATEFLAG_HAS_POSITION);
-
+#endif
     m_attackTimer[BASE_ATTACK]   = 0;
     m_attackTimer[OFF_ATTACK]    = 0;
     m_attackTimer[RANGED_ATTACK] = 0;
@@ -1322,17 +1323,17 @@ void Unit::CalculateMeleeDamage(Unit* pVictim, uint32 damage, CalcDamageInfo* da
         case BASE_ATTACK:
             damageInfo->procAttacker = PROC_FLAG_SUCCESSFUL_MELEE_HIT;
             damageInfo->procVictim   = PROC_FLAG_TAKEN_MELEE_HIT;
-            damageInfo->HitInfo      = HITINFO_NORMALSWING2;
+            damageInfo->HitInfo      = HITINFO_NORMALSWING + HITINFO_AFFECTS_VICTIM;
             break;
         case OFF_ATTACK:
             damageInfo->procAttacker = PROC_FLAG_SUCCESSFUL_MELEE_HIT | PROC_FLAG_SUCCESSFUL_OFFHAND_HIT;
             damageInfo->procVictim   = PROC_FLAG_TAKEN_MELEE_HIT;//|PROC_FLAG_TAKEN_OFFHAND_HIT // not used
-            damageInfo->HitInfo = HITINFO_LEFTSWING;
+            damageInfo->HitInfo      = HITINFO_LEFTSWING + HITINFO_AFFECTS_VICTIM;
             break;
         case RANGED_ATTACK:
             damageInfo->procAttacker = PROC_FLAG_SUCCESSFUL_RANGED_HIT;
             damageInfo->procVictim   = PROC_FLAG_TAKEN_RANGED_HIT;
-            damageInfo->HitInfo = HITINFO_UNK3;             // test (dev note: test what? HitInfo flag possibly not confirmed.)
+            damageInfo->HitInfo      = HITINFO_UNK3;             // test (dev note: test what? HitInfo flag possibly not confirmed.)
             break;
         default:
             break;
@@ -1598,6 +1599,10 @@ void Unit::CalculateMeleeDamage(Unit* pVictim, uint32 damage, CalcDamageInfo* da
     }
     else
         damageInfo->totalDamage = 0;
+
+    // No animation on victim in this case.
+    if (!damageInfo->totalDamage && (damageInfo->HitInfo & (HITINFO_MISS | HITINFO_ABSORB)))
+        damageInfo->HitInfo &= ~HITINFO_AFFECTS_VICTIM;
 }
 
 void Unit::DealMeleeDamage(CalcDamageInfo* damageInfo, bool durabilityLoss)
@@ -1612,7 +1617,7 @@ void Unit::DealMeleeDamage(CalcDamageInfo* damageInfo, bool durabilityLoss)
         return;
 
     // Hmmmm dont like this emotes client must by self do all animations
-    if (damageInfo->HitInfo & HITINFO_CRITICALHIT)
+    if (damageInfo->totalDamage && (damageInfo->HitInfo & HITINFO_CRITICALHIT))
     {
         if (!(pVictim->IsCreature() && 
            (static_cast<Creature*>(pVictim)->GetCreatureInfo()->type_flags & CREATURE_TYPEFLAGS_NO_WOUND_ANIM)))
@@ -2086,9 +2091,9 @@ void Unit::AttackerStateUpdate(Unit* pVictim, WeaponAttackType attType, bool che
 
     uint32 hitInfo;
     if (attType == BASE_ATTACK)
-        hitInfo = HITINFO_NORMALSWING2;
+        hitInfo = HITINFO_NORMALSWING + HITINFO_AFFECTS_VICTIM;
     else if (attType == OFF_ATTACK)
-        hitInfo = HITINFO_LEFTSWING;
+        hitInfo = HITINFO_LEFTSWING + HITINFO_AFFECTS_VICTIM;
     else
         return;                                             // ignore ranged case
 
@@ -2897,6 +2902,17 @@ bool Unit::IsBehindTarget(Unit const* pTarget, bool strict) const
     }
 
     return !pTarget->HasInArc(M_PI_F, this);
+}
+
+bool Unit::CantPathToVictim() const
+{
+    if (!GetVictim())
+        return false;
+
+    if (GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
+        return false;
+
+    return !GetMotionMaster()->GetCurrent()->IsReachable();
 }
 
 bool Unit::IsInAccessablePlaceFor(Creature const* c) const
@@ -6208,7 +6224,7 @@ void Unit::CheckPendingMovementChanges()
         }
 
         // Not resendable change.
-        if (oldestChangeToAck.movementChangeType == INVALID || oldestChangeToAck.movementChangeType == KNOCK_BACK)
+        if (oldestChangeToAck.movementChangeType == INVALID || oldestChangeToAck.movementChangeType == TELEPORT || oldestChangeToAck.movementChangeType == KNOCK_BACK)
         {
             pController->GetCheatData()->OnFailedToAckChange();
             PopPendingMovementChange();
@@ -6371,6 +6387,25 @@ bool Unit::FindPendingMovementRootChange(uint32 movementCounter, bool applyRecei
     return false;
 }
 
+bool Unit::FindPendingMovementTeleportChange(uint32 movementCounter)
+{
+    for (auto pendingChange = m_pendingMovementChanges.begin(); pendingChange != m_pendingMovementChanges.end(); pendingChange++)
+    {
+
+#if SUPPORTED_CLIENT_BUILD <= CLIENT_BUILD_1_9_4
+        movementCounter = pendingChange->movementCounter;
+#endif
+
+        if (pendingChange->movementCounter != movementCounter || pendingChange->movementChangeType != TELEPORT)
+            continue;
+
+        m_pendingMovementChanges.erase(pendingChange);
+        return true;
+    }
+
+    return false;
+}
+
 bool Unit::FindPendingMovementKnockbackChange(MovementInfo& movementInfo, uint32 movementCounter)
 {
     for (auto pendingChange = m_pendingMovementChanges.begin(); pendingChange != m_pendingMovementChanges.end(); pendingChange++)
@@ -6441,7 +6476,7 @@ bool Unit::IsMovedByPlayer() const
         if (pPossessor->GetCharmGuid() == GetObjectGuid())
             return true;
 
-    return IsPlayer();
+    return IsPlayer() && !static_cast<Player const*>(this)->GetSession()->GetBot();
 }
 
 PlayerMovementPendingChange::PlayerMovementPendingChange()
@@ -8637,6 +8672,15 @@ void Unit::UpdateReactives(uint32 p_time)
     }
 }
 
+uint8 Unit::GetEnemyCountInRadiusAround(Unit* pTarget, float radius) const
+{
+    std::list<Unit*> targets;
+    MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck u_check(pTarget, this, radius);
+    MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> searcher(targets, u_check);
+    Cell::VisitAllObjects(pTarget, searcher, radius);
+    return targets.size();
+}
+
 Unit* Unit::SelectRandomUnfriendlyTarget(Unit* except /*= nullptr*/, float radius /*= ATTACK_DISTANCE*/, bool inFront /*= false*/, bool isValidAttackTarget /*= false*/) const
 {
     std::list<Unit*> targets;
@@ -9431,9 +9475,9 @@ void Unit::GetRandomAttackPoint(Unit const* attacker, float &x, float &y, float 
     float initialPosX, initialPosY, initialPosZ, o;
     GetPosition(initialPosX, initialPosY, initialPosZ);
 
-    // Moving player: try to interpolate movement a bit
+    // Moving player: try to extrapolate movement a bit
     if (IsPlayer() && IsMoving())
-        if (!ToPlayer()->GetCheatData()->InterpolateMovement(m_movementInfo, 200, initialPosX, initialPosY, initialPosZ, o))
+        if (!ToPlayer()->GetCheatData()->ExtrapolateMovement(m_movementInfo, 200, initialPosX, initialPosY, initialPosZ, o))
             GetPosition(initialPosX, initialPosY, initialPosZ);
 
     float attackerTargetDistance = sqrt(pow(initialPosX - attacker->GetPositionX(), 2) +
@@ -9621,6 +9665,16 @@ bool Unit::IsImmuneToSchoolMask(uint32 schoolMask) const
         if (immuneMask & schoolMask)             // Immunise
             return true;
     }
+    return false;
+}
+
+bool Unit::IsImmuneToMechanic(Mechanics mechanic) const
+{
+    SpellImmuneList const& mechanicList = m_spellImmune[IMMUNITY_MECHANIC];
+    for (const auto& itr : mechanicList)
+        if (itr.type == mechanic)
+            return true;
+
     return false;
 }
 
